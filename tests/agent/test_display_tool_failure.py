@@ -96,6 +96,72 @@ class TestDetectToolFailureStructured:
         result = json.dumps({"success": True, "data": "hello"})
         assert _detect_tool_failure("web_search", result) == (False, "")
 
+    def test_web_extract_success_with_null_error_not_flagged(self):
+        """Regression: web_extract always serializes `"error": null`.
+
+        The old substring check for `"error"` treated every successful extract
+        as a failure, which after 4 calls tripped `same_tool_failure_halt`
+        and killed research turns with a guardrail message.
+        """
+        result = json.dumps(
+            {
+                "results": [
+                    {
+                        "url": "https://example.com/article",
+                        "title": "Hello",
+                        "content": "Useful article body with plenty of text.",
+                        "error": None,
+                    }
+                ]
+            },
+            indent=2,
+        )
+        assert _detect_tool_failure("web_extract", result) == (False, "")
+
+    def test_web_extract_partial_success_not_flagged(self):
+        result = json.dumps(
+            {
+                "results": [
+                    {
+                        "url": "https://blocked.example/a",
+                        "title": "",
+                        "content": "",
+                        "error": "Scrape aborted",
+                    },
+                    {
+                        "url": "https://ok.example/b",
+                        "title": "OK",
+                        "content": "Recovered content from a friendly source.",
+                        "error": None,
+                    },
+                ]
+            }
+        )
+        assert _detect_tool_failure("web_extract", result) == (False, "")
+
+    def test_web_extract_all_empty_is_failure(self):
+        result = json.dumps(
+            {
+                "results": [
+                    {
+                        "url": "https://blocked.example/a",
+                        "title": "",
+                        "content": "",
+                        "error": "Scrape aborted after timeout",
+                    },
+                    {
+                        "url": "https://blocked.example/b",
+                        "title": "",
+                        "content": "",
+                        "error": None,
+                    },
+                ]
+            }
+        )
+        is_failure, suffix = _detect_tool_failure("web_extract", result)
+        assert is_failure is True
+        assert "Scrape aborted" in suffix or "empty" in suffix.lower()
+
 
 
 class TestGetCuteToolMessageFailureSuffix:

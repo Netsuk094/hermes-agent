@@ -1310,6 +1310,12 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
     tag like ``" [exit 1]"`` for terminal failures, ``" [full]"`` for memory
     overflow, or a trimmed error message (``" [File not found: foo.py]"``).
     On success returns ``(False, "")``.
+
+    Important: multi-result tools (``web_extract``, ``web_search``) always
+    include an ``"error"`` key per item — often ``null`` on success. A naive
+    substring search for ``"error"`` therefore false-positives every extract
+    and trips ``same_tool_failure_halt`` after a few calls. Always parse JSON
+    and require a *truthy* error / empty usable content before failing.
     """
     if result is None:
         return False, ""
@@ -1335,19 +1341,66 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
             if data.get("success") is False and "exceed the limit" in data.get("error", ""):
                 return True, " [full]"
 
-    # Structured error in JSON result (any tool that surfaces {"error": ...}).
     if isinstance(data, dict):
-        err = data.get("error") or data.get("message")
-        if err and (data.get("success") is False or "error" in data):
-            return True, f" [{_trim_error(str(err))}]"
+        results = data.get("results")
+        # Multi-result tools (web_extract / web_search / scrapers): fail only
+        # when *no* item produced usable content. Partial success is success.
+        if isinstance(results, list) and results:
+            usable = False
+            first_err: str | None = None
+            for item in results:
+                if not isinstance(item, dict):
+                    if item:
+                        usable = True
+                    continue
+                content = (
+                    item.get("content")
+                    or item.get("raw_content")
+                    or item.get("snippet")
+                    or item.get("title")
+                    or ""
+                )
+                if isinstance(content, str) and content.strip():
+                    usable = True
+                    continue
+                item_err = item.get("error")
+                if item_err and first_err is None:
+                    first_err = str(item_err)
+            if usable:
+                return False, ""
+            # Every item empty / errored.
+            msg = first_err or "all results empty or inaccessible"
+            return True, f" [{_trim_error(msg)}]"
 
-    # Generic heuristic for non-terminal tools
+        # Structured top-level error envelope.
+        err = data.get("error") or data.get("message")
+        if err and data.get("success") is False:
+            return True, f" [{_trim_error(str(err))}]"
+        if err and data.get("success") is not True and "results" not in data:
+            # {"error": "..."} without an explicit success:true
+            return True, f" [{_trim_error(str(err))}]"
+        if data.get("success") is False:
+            err_msg = data.get("error") or data.get("message") or "failed"
+            return True, f" [{_trim_error(str(err_msg))}]"
+        # Explicit success or empty-but-ok multi-result shell.
+        if data.get("success") is True or "results" in data:
+            return False, ""
+
+    # Generic heuristic for non-JSON / non-structured tools.
     # Multimodal tool results (dicts with _multimodal=True) are not strings —
     # treat them as successes since failures would be JSON-encoded strings.
     if not isinstance(result, str):
         return False, ""
-    lower = result[:500].lower()
-    if '"error"' in lower or '"failed"' in lower or result.startswith("Error"):
+    if result.startswith("Error"):
+        return True, " [error]"
+    head = result[:800]
+    # Require a non-null, non-empty JSON string error value — NOT the mere key
+    # name ``"error"`` (web_extract always serializes ``"error": null``).
+    if re.search(r'"error"\s*:\s*"(?!null)(?:\\.|[^"\\])+"', head):
+        return True, " [error]"
+    if re.search(r'"success"\s*:\s*false\b', head, re.IGNORECASE):
+        return True, " [error]"
+    if re.search(r'"failed"\s*:\s*true\b', head, re.IGNORECASE):
         return True, " [error]"
 
     return False, ""

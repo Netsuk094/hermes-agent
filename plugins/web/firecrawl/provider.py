@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from agent.web_search_provider import WebSearchProvider
@@ -55,6 +56,104 @@ from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
+
+# Minimum chars of extracted body before we treat Firecrawl output as usable.
+# Short shells (cookie walls, empty SPA shells) trigger the Jina Reader fallback.
+_MIN_USABLE_EXTRACT_CHARS = 200
+_JINA_READER_PREFIX = "https://r.jina.ai/"
+_JINA_TIMEOUT_S = 40.0
+
+
+def _content_usable(content: Any) -> bool:
+    """Return True when extract body is non-empty enough to be useful.
+
+    Rejects empty shells and obvious soft-404 / cookie-wall pages that are
+    long in characters but contain no article substance.
+    """
+    if not isinstance(content, str):
+        return False
+    body = content.strip()
+    if len(body) < _MIN_USABLE_EXTRACT_CHARS:
+        return False
+    head = body[:2500].lower()
+    # CoinDesk soft-404 + similar shells still ship long nav/cookie HTML.
+    soft_404_markers = (
+        "hmm, that's weird",
+        "page not found",
+        "404. page not found",
+        "couldn't find this page",
+        "could not find this page",
+    )
+    if any(m in head for m in soft_404_markers):
+        return False
+    if re.search(r"(?m)^#\s*404\s*$", body[:800]):
+        return False
+    return True
+
+
+def _jina_reader_extract(url: str) -> Optional[Dict[str, Any]]:
+    """Fetch page text via Jina Reader (``r.jina.ai``) as extract fallback.
+
+    Firecrawl (self-hosted or cloud) often returns empty markdown for
+    anti-bot / paywalled article pages (CoinDesk, Reuters, etc.). Jina's
+    reader proxy frequently still returns clean markdown for the same URL.
+    Returns a web_extract-shaped result dict, or None on failure.
+    """
+    if not url or not isinstance(url, str):
+        return None
+    # Avoid recursive proxying if the agent already passed a jina URL.
+    if url.startswith(_JINA_READER_PREFIX) or "r.jina.ai/" in url:
+        return None
+    if not is_safe_url(url):
+        return None
+
+    jina_url = f"{_JINA_READER_PREFIX}{url}"
+    try:
+        import httpx
+    except ImportError:
+        logger.debug("Jina fallback skipped: httpx not available")
+        return None
+
+    try:
+        with httpx.Client(timeout=_JINA_TIMEOUT_S, follow_redirects=True) as client:
+            resp = client.get(
+                jina_url,
+                headers={
+                    "User-Agent": "HermesAgent-web_extract/1.0",
+                    "Accept": "text/plain, text/markdown, */*",
+                },
+            )
+            if resp.status_code >= 400:
+                logger.info(
+                    "Jina reader fallback HTTP %s for %s", resp.status_code, url
+                )
+                return None
+            body = (resp.text or "").strip()
+    except Exception as exc:  # noqa: BLE001 — fallback must never raise
+        logger.info("Jina reader fallback failed for %s: %s", url, exc)
+        return None
+
+    if not _content_usable(body):
+        logger.info("Jina reader fallback returned empty/short body for %s", url)
+        return None
+
+    title = ""
+    for line in body.splitlines()[:12]:
+        stripped = line.strip()
+        if stripped.lower().startswith("title:"):
+            title = stripped.split(":", 1)[1].strip()
+            break
+
+    logger.info(
+        "Jina reader fallback recovered %d chars for %s", len(body), url
+    )
+    return {
+        "url": url,
+        "title": title,
+        "content": body,
+        "raw_content": body,
+        "metadata": {"source": "jina_reader_fallback", "sourceURL": url},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +584,12 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
 
             try:
                 logger.info("Firecrawl scraping: %s", url)
+                scrape_err_msg: Optional[str] = None
+                chosen_content = ""
+                title = ""
+                final_url = url
+                metadata: Dict[str, Any] = {}
+
                 try:
                     scrape_result = await asyncio.wait_for(
                         asyncio.to_thread(
@@ -496,97 +601,123 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
                     )
                 except asyncio.TimeoutError:
                     logger.warning("Firecrawl scrape timed out for %s", url)
-                    results.append(
-                        {
-                            "url": url,
-                            "title": "",
-                            "content": "",
-                            "error": (
-                                "Scrape timed out after 60s — page may be too large "
-                                "or unresponsive. Try browser_navigate instead."
-                            ),
-                        }
+                    scrape_err_msg = (
+                        "Scrape timed out after 60s — page may be too large "
+                        "or unresponsive."
                     )
-                    continue
+                    scrape_result = None
 
-                scrape_payload = _extract_scrape_payload(scrape_result)
-                metadata = scrape_payload.get("metadata", {})
-                content_markdown = scrape_payload.get("markdown")
-                content_html = scrape_payload.get("html")
+                if scrape_result is not None:
+                    scrape_payload = _extract_scrape_payload(scrape_result)
+                    metadata = scrape_payload.get("metadata", {})
+                    content_markdown = scrape_payload.get("markdown")
+                    content_html = scrape_payload.get("html")
 
-                # Ensure metadata is a dict (SDK may return a typed object)
-                if not isinstance(metadata, dict):
-                    if hasattr(metadata, "model_dump"):
-                        metadata = metadata.model_dump()
-                    elif hasattr(metadata, "__dict__"):
-                        metadata = metadata.__dict__
+                    # Ensure metadata is a dict (SDK may return a typed object)
+                    if not isinstance(metadata, dict):
+                        if hasattr(metadata, "model_dump"):
+                            metadata = metadata.model_dump()
+                        elif hasattr(metadata, "__dict__"):
+                            metadata = metadata.__dict__
+                        else:
+                            metadata = {}
+
+                    title = metadata.get("title", "") or ""
+                    final_url = metadata.get("sourceURL", url) or url
+
+                    # Re-check SSRF safety after any redirect reported by Firecrawl.
+                    if not is_safe_url(final_url):
+                        logger.info(
+                            "Blocked redirected web_extract for unsafe final URL: %s",
+                            final_url,
+                        )
+                        results.append(
+                            {
+                                "url": final_url,
+                                "title": title,
+                                "content": "",
+                                "raw_content": "",
+                                "error": (
+                                    "Blocked: URL targets a private or internal "
+                                    "network address"
+                                ),
+                            }
+                        )
+                        continue
+
+                    # Re-check website-access policy after any redirect
+                    final_blocked = check_website_access(final_url)
+                    if final_blocked:
+                        logger.info(
+                            "Blocked redirected web_extract for %s by rule %s",
+                            final_blocked["host"],
+                            final_blocked["rule"],
+                        )
+                        results.append(
+                            {
+                                "url": final_url,
+                                "title": title,
+                                "content": "",
+                                "raw_content": "",
+                                "error": final_blocked["message"],
+                                "blocked_by_policy": {
+                                    "host": final_blocked["host"],
+                                    "rule": final_blocked["rule"],
+                                    "source": final_blocked["source"],
+                                },
+                            }
+                        )
+                        continue
+
+                    # Choose markdown vs html according to the requested format
+                    if format == "markdown" or (format is None and content_markdown):
+                        chosen_content = content_markdown or ""
                     else:
-                        metadata = {}
+                        chosen_content = content_html or content_markdown or ""
 
-                title = metadata.get("title", "")
-                final_url = metadata.get("sourceURL", url)
+                # Fallback: Firecrawl empty / timed out / shell-only → Jina Reader.
+                # Recoverable anti-bot pages (CoinDesk articles, Reuters, …)
+                # frequently return empty markdown from local Firecrawl while
+                # r.jina.ai still yields full article text.
+                if not _content_usable(chosen_content):
+                    jina_result = await asyncio.to_thread(_jina_reader_extract, url)
+                    if jina_result is not None:
+                        results.append(jina_result)
+                        continue
 
-                # Re-check SSRF safety after any redirect reported by Firecrawl.
-                if not is_safe_url(final_url):
-                    logger.info(
-                        "Blocked redirected web_extract for unsafe final URL: %s",
-                        final_url,
-                    )
+                if _content_usable(chosen_content) or (
+                    isinstance(chosen_content, str) and chosen_content.strip()
+                ):
                     results.append(
                         {
                             "url": final_url,
                             "title": title,
+                            "content": chosen_content,
+                            "raw_content": chosen_content,
+                            "metadata": metadata,
+                        }
+                    )
+                else:
+                    results.append(
+                        {
+                            "url": final_url or url,
+                            "title": title,
                             "content": "",
                             "raw_content": "",
-                            "error": (
-                                "Blocked: URL targets a private or internal "
-                                "network address"
+                            "error": scrape_err_msg
+                            or (
+                                "Extract returned empty content (page blocked, "
+                                "paywalled, or unreadable). Prefer web_search "
+                                "snippets or a different source."
                             ),
                         }
                     )
-                    continue
-
-                # Re-check website-access policy after any redirect
-                final_blocked = check_website_access(final_url)
-                if final_blocked:
-                    logger.info(
-                        "Blocked redirected web_extract for %s by rule %s",
-                        final_blocked["host"],
-                        final_blocked["rule"],
-                    )
-                    results.append(
-                        {
-                            "url": final_url,
-                            "title": title,
-                            "content": "",
-                            "raw_content": "",
-                            "error": final_blocked["message"],
-                            "blocked_by_policy": {
-                                "host": final_blocked["host"],
-                                "rule": final_blocked["rule"],
-                                "source": final_blocked["source"],
-                            },
-                        }
-                    )
-                    continue
-
-                # Choose markdown vs html according to the requested format
-                if format == "markdown" or (format is None and content_markdown):
-                    chosen_content = content_markdown
-                else:
-                    chosen_content = content_html or content_markdown or ""
-
-                results.append(
-                    {
-                        "url": final_url,
-                        "title": title,
-                        "content": chosen_content,
-                        "raw_content": chosen_content,
-                        "metadata": metadata,
-                    }
-                )
             except Exception as scrape_err:  # noqa: BLE001
                 logger.debug("Firecrawl scrape failed for %s: %s", url, scrape_err)
+                jina_result = await asyncio.to_thread(_jina_reader_extract, url)
+                if jina_result is not None:
+                    results.append(jina_result)
+                    continue
                 results.append(
                     {
                         "url": url,

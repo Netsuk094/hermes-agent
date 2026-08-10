@@ -1002,17 +1002,23 @@ async def web_extract_tool(
             else:
                 logger.info("%s (%d chars, whole)", url, len(clean))
 
-        # Trim output to minimal fields per entry: title, content, error
-        trimmed_results = [
-            {
+        # Trim output to minimal fields per entry: title, content, error.
+        # Omit null ``error`` keys so successful pages don't serialize
+        # ``"error": null`` (which previously false-positived failure
+        # detectors that substring-searched for the key name).
+        trimmed_results = []
+        for r in response.get("results", []):
+            entry = {
                 "url": r.get("url", ""),
                 "title": r.get("title", ""),
                 "content": r.get("content", ""),
-                "error": r.get("error"),
-                **({  "blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
             }
-            for r in response.get("results", [])
-        ]
+            err = r.get("error")
+            if err:
+                entry["error"] = err
+            if "blocked_by_policy" in r:
+                entry["blocked_by_policy"] = r["blocked_by_policy"]
+            trimmed_results.append(entry)
         trimmed_response = {"results": trimmed_results}
 
         if trimmed_response.get("results") == []:

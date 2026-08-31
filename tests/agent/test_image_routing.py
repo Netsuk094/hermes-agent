@@ -34,6 +34,12 @@ class TestCoerceMode:
         assert _coerce_mode(None) == "auto"
         assert _coerce_mode(42) == "auto"
 
+    def test_tool_alias_is_text(self):
+        # Older configs (warren) wrote image_input_mode: tool to mean
+        # "pre-analyze via vision_analyze". That is the text pipeline.
+        assert _coerce_mode("tool") == "text"
+        assert _coerce_mode("TOOL") == "text"
+
 
 
 # ─── _explicit_aux_vision_override ───────────────────────────────────────────

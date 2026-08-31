@@ -174,6 +174,78 @@ class TestExtractCacheBustingConfig:
 
         assert out["tools.registry_generation"] == 12345
 
+    def test_platform_hints_change_alters_extracted_blob_and_signature(self):
+        """TEST 1: editing platform_hints.matrix.append must change the signature."""
+        from gateway.run import GatewayRunner
+
+        cfg_v1 = {
+            "platform_hints": {
+                "matrix": {
+                    "append": "When responding through Matrix/Element X, optimize "
+                    "for narrow smartphone screens.",
+                }
+            }
+        }
+        cfg_v2 = {
+            "platform_hints": {
+                "matrix": {
+                    "append": "When responding through Matrix/Element X, optimize "
+                    "for narrow smartphone screens. Visual hierarchy with "
+                    "category emojis.",
+                }
+            }
+        }
+        out_v1 = GatewayRunner._extract_cache_busting_config(cfg_v1)
+        out_v2 = GatewayRunner._extract_cache_busting_config(cfg_v2)
+        assert out_v1["platform_hints"] != out_v2["platform_hints"]
+        runtime = {"api_key": "sk-test", "base_url": "http://localhost", "provider": "local"}
+        sig_v1 = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=out_v1,
+        )
+        sig_v2 = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=out_v2,
+        )
+        assert sig_v1 != sig_v2
+
+    def test_platform_hints_same_content_stable_across_key_order(self):
+        """TEST 2: identical platform_hints (any key order) keep the same signature."""
+        from gateway.run import GatewayRunner
+
+        cfg_a = {
+            "platform_hints": {
+                "telegram": {"append": "keep it short"},
+                "matrix": {"append": "mobile-first", "replace": ""},
+            }
+        }
+        cfg_b = {
+            "platform_hints": {
+                "matrix": {"replace": "", "append": "mobile-first"},
+                "telegram": {"append": "keep it short"},
+            }
+        }
+        out_a = GatewayRunner._extract_cache_busting_config(cfg_a)
+        out_b = GatewayRunner._extract_cache_busting_config(cfg_b)
+        assert out_a["platform_hints"] == out_b["platform_hints"]
+        runtime = {"api_key": "sk-test", "base_url": "http://localhost", "provider": "local"}
+        sig_a = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=out_a,
+        )
+        sig_b = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=out_b,
+        )
+        assert sig_a == sig_b
+
+    def test_missing_or_malformed_platform_hints_are_none(self):
+        from gateway.run import GatewayRunner
+
+        assert GatewayRunner._extract_cache_busting_config({})["platform_hints"] is None
+        assert GatewayRunner._extract_cache_busting_config(
+            {"platform_hints": "broken"}
+        )["platform_hints"] is None
+        assert GatewayRunner._extract_cache_busting_config(
+            {"platform_hints": {}}
+        )["platform_hints"] is None
+
 
 class TestAgentCacheLifecycle:
     """End-to-end cache behavior with real AIAgent construction."""

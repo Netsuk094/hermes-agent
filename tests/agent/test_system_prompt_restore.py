@@ -20,7 +20,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agent.conversation_loop import _restore_or_build_system_prompt
+from agent.conversation_loop import (
+    _restore_or_build_system_prompt,
+    _stored_platform_hint_override_is_current,
+    _stored_prompt_matches_runtime,
+)
 
 
 def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
@@ -112,6 +116,142 @@ class TestStoredPromptReuse:
             agent.session_id, agent._cached_system_prompt
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
+
+
+_MATRIX_V1_APPEND = (
+    "When responding through Matrix/Element X, optimize technical "
+    "information for narrow smartphone screens."
+)
+_MATRIX_V2_APPEND = (
+    _MATRIX_V1_APPEND
+    + " Visual hierarchy with category emojis: one per major category."
+)
+_MATRIX_PROMPT_V1 = (
+    "You are in a Matrix room communicating with your user.\n\n"
+    f"{_MATRIX_V1_APPEND}\n\n"
+    "Conversation started: Wednesday, August 26, 2026\n"
+    "Session ID: test-session-id\n"
+    "Model: test-model\n"
+    "Provider: openrouter\n"
+    "Platform: matrix"
+)
+_TELEGRAM_PROMPT = (
+    "You are on a text messaging communication platform, Telegram.\n\n"
+    "Conversation started: Wednesday, August 26, 2026\n"
+    "Session ID: test-session-id\n"
+    "Model: test-model\n"
+    "Provider: openrouter\n"
+    "Platform: telegram"
+)
+_TUI_PROMPT = (
+    "You are running in the Hermes terminal UI (TUI).\n\n"
+    "Conversation started: Wednesday, August 26, 2026\n"
+    "Session ID: test-session-id\n"
+    "Model: test-model\n"
+    "Provider: openrouter\n"
+    "Platform: tui"
+)
+
+
+class TestPlatformHintOverrideFreshness:
+    """platform_hints config edits must stale THIS platform's stored prompt
+    once, without contaminating Telegram/TUI sessions."""
+
+    def test_stale_matrix_append_does_not_match(self):
+        """TEST 3 + TEST 5: persisted v1 + runtime v2 → False; platform stays matrix."""
+        agent = _make_agent()
+        agent.platform = "matrix"
+        agent._platform_hint_overrides = {"matrix": {"append": _MATRIX_V2_APPEND}}
+        assert agent.platform == "matrix"
+        assert _stored_prompt_matches_runtime(agent, _MATRIX_PROMPT_V1) is False
+        assert _stored_platform_hint_override_is_current(agent, _MATRIX_PROMPT_V1) is False
+
+    def test_current_matrix_append_matches(self):
+        """TEST 4: persisted prompt already contains v2 → True."""
+        agent = _make_agent()
+        agent.platform = "matrix"
+        agent._platform_hint_overrides = {"matrix": {"append": _MATRIX_V2_APPEND}}
+        stored = _MATRIX_PROMPT_V1.replace(_MATRIX_V1_APPEND, _MATRIX_V2_APPEND)
+        assert _MATRIX_V2_APPEND in stored
+        assert _stored_prompt_matches_runtime(agent, stored) is True
+
+    def test_stale_matrix_append_rebuilds_once_and_persists(self, caplog):
+        """Restore path: v1 stored + v2 overrides → rebuild + persist, not reuse."""
+        rebuilt = _MATRIX_PROMPT_V1.replace(_MATRIX_V1_APPEND, _MATRIX_V2_APPEND)
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": _MATRIX_PROMPT_V1}
+        agent = _make_agent(session_db=db, prebuilt_prompt=rebuilt)
+        agent.platform = "matrix"
+        agent._platform_hint_overrides = {"matrix": {"append": _MATRIX_V2_APPEND}}
+
+        with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
+            _restore_or_build_system_prompt(
+                agent, None, [{"role": "user", "content": "hi"}]
+            )
+
+        agent._build_system_prompt.assert_called_once_with(None)
+        assert agent._cached_system_prompt == rebuilt
+        db.update_system_prompt.assert_called_once_with(agent.session_id, rebuilt)
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("stale runtime identity" in m and "platform=matrix" in m for m in messages)
+
+    def test_current_matrix_append_reuses_stored_prompt(self):
+        stored = _MATRIX_PROMPT_V1.replace(_MATRIX_V1_APPEND, _MATRIX_V2_APPEND)
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = _make_agent(session_db=db)
+        agent.platform = "matrix"
+        agent._platform_hint_overrides = {"matrix": {"append": _MATRIX_V2_APPEND}}
+
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+        db.update_system_prompt.assert_not_called()
+
+    def test_telegram_unaffected_by_matrix_override(self):
+        """TEST 6: matrix-only override must not stale a Telegram prompt."""
+        agent = _make_agent()
+        agent.platform = "telegram"
+        agent._platform_hint_overrides = {"matrix": {"append": _MATRIX_V2_APPEND}}
+        assert agent.platform == "telegram"
+        assert _stored_prompt_matches_runtime(agent, _TELEGRAM_PROMPT) is True
+        assert _MATRIX_V2_APPEND not in _TELEGRAM_PROMPT
+
+    def test_tui_unaffected_by_matrix_override(self):
+        """TEST 7: matrix-only override must not stale a TUI prompt."""
+        agent = _make_agent()
+        agent.platform = "tui"
+        agent._platform_hint_overrides = {"matrix": {"append": _MATRIX_V2_APPEND}}
+        assert agent.platform == "tui"
+        assert _stored_prompt_matches_runtime(agent, _TUI_PROMPT) is True
+
+    def test_platform_isolation_matrix_does_not_require_telegram_hint(self):
+        """TEST 8: a Matrix session is not invalidated by a Telegram override."""
+        agent = _make_agent()
+        agent.platform = "matrix"
+        agent._platform_hint_overrides = {
+            "matrix": {"append": _MATRIX_V1_APPEND},
+            "telegram": {"append": "Prefer short Telegram messages."},
+        }
+        assert _stored_prompt_matches_runtime(agent, _MATRIX_PROMPT_V1) is True
+
+        telegram_agent = _make_agent()
+        telegram_agent.platform = "telegram"
+        telegram_agent._platform_hint_overrides = {
+            "matrix": {"append": _MATRIX_V2_APPEND},
+            "telegram": {"append": "Prefer short Telegram messages."},
+        }
+        assert _stored_prompt_matches_runtime(telegram_agent, _TELEGRAM_PROMPT) is False
+        telegram_prompt_current = (
+            _TELEGRAM_PROMPT.replace(
+                "Telegram.\n\n",
+                "Telegram.\n\nPrefer short Telegram messages.\n\n",
+            )
+        )
+        assert _stored_prompt_matches_runtime(
+            telegram_agent, telegram_prompt_current
+        ) is True
 
 
 # ---------------------------------------------------------------------------

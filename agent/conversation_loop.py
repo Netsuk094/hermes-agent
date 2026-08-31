@@ -617,10 +617,11 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         stored_state = "stale_runtime"
         logger.info(
             "Stored system prompt for session %s has stale runtime identity; "
-            "rebuilding for model=%s provider=%s.",
+            "rebuilding for model=%s provider=%s platform=%s.",
             agent.session_id,
             getattr(agent, "model", "") or "",
             getattr(agent, "provider", "") or "",
+            getattr(agent, "platform", "") or "",
         )
 
     if conversation_history and stored_state in ("null", "empty"):
@@ -684,7 +685,13 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
 
 def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
-    """Return False when the persisted runtime-identity lines are stale."""
+    """Return False when the persisted runtime-identity lines are stale.
+
+    Also returns False when this agent's ``platform_hints`` config override
+    (append/replace for ``agent.platform`` only) is missing from *prompt*,
+    so a config edit can rebuild the frozen system prompt once without
+    requiring ``/new``. Other platforms are unaffected.
+    """
 
     def line_value(label: str) -> str:
         """Last matching line wins.
@@ -756,6 +763,45 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     if stored_platform and current_platform and stored_platform != current_platform:
         return False
 
+    # Config platform_hints override for THIS platform must still appear in
+    # the stored prompt. Other platforms' overrides cannot bust this session.
+    if not _stored_platform_hint_override_is_current(agent, prompt):
+        return False
+
+    return True
+
+
+def _stored_platform_hint_override_is_current(agent, prompt: str) -> bool:
+    """Return False when this platform's config platform_hints text is missing.
+
+    Only the override for *this* agent's platform is checked. Sessions on
+    Telegram/TUI/CLI (no matching override) keep the prefix-cache restore
+    path. Malformed entries and MagicMock test stubs without a real dict
+    are treated as current so a bad config value can never force a rebuild
+    every turn.
+    """
+    platform = str(getattr(agent, "platform", "") or "").strip().lower()
+    if not platform or not isinstance(prompt, str) or not prompt:
+        return True
+    overrides = getattr(agent, "_platform_hint_overrides", None)
+    if not isinstance(overrides, dict) or not overrides:
+        return True
+    spec = overrides.get(platform)
+    if spec is None:
+        return True
+    if isinstance(spec, str):
+        extra = spec.strip()
+        return (not extra) or extra in prompt
+    if not isinstance(spec, dict):
+        return True
+    replace_text = spec.get("replace")
+    if isinstance(replace_text, str) and replace_text.strip():
+        if replace_text.strip() not in prompt:
+            return False
+    append_text = spec.get("append")
+    if isinstance(append_text, str) and append_text.strip():
+        if append_text.strip() not in prompt:
+            return False
     return True
 
 

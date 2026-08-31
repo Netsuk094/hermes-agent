@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 
 
 _VALID_MODES = frozenset({"auto", "native", "text"})
+# Warren (and older configs) used ``tool`` to mean "run vision_analyze".
+# That is the text pipeline, not a fourth mode.
+_MODE_ALIASES = {"tool": "text"}
 
 
 # Image extensions used by extract_image_refs(). Kept tight on purpose — we
@@ -352,6 +355,8 @@ def _coerce_mode(raw: Any) -> str:
     if not isinstance(raw, str):
         return "auto"
     val = raw.strip().lower()
+    if val in _MODE_ALIASES:
+        return _MODE_ALIASES[val]
     if val in _VALID_MODES:
         return val
     return "auto"

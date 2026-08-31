@@ -23066,6 +23066,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             out["tools.registry_generation"] = None
 
+        # Top-level platform_hints is a mapping of platform → append/replace
+        # overrides baked into the frozen system prompt. It is not a
+        # (section, key) pair, so it lives outside _CACHE_BUSTING_CONFIG_KEYS.
+        # Canonical JSON keeps key-order noise from spuriously busting the
+        # cache; a change to any platform's override still changes the blob.
+        hints = cfg.get("platform_hints")
+        if isinstance(hints, dict) and hints:
+            try:
+                out["platform_hints"] = json.dumps(hints, sort_keys=True, default=str)
+            except (TypeError, ValueError):
+                out["platform_hints"] = None
+        else:
+            out["platform_hints"] = None
+
         # Honcho identity-mapping keys live in honcho.json, not user_config.
         # Only read that file when Honcho is the active memory provider.
         provider = cfg_get(cfg, "memory", "provider")

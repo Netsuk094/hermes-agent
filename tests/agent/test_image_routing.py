@@ -420,6 +420,21 @@ class TestFormatCompatibility:
         b64 = url.split(",", 1)[1]
         assert base64.b64decode(b64) == _png_bytes()
 
+    def test_webp_transcoded_to_png(self, tmp_path: Path):
+        """WebP must be transcoded to PNG: llama.cpp mtmd uses stb_image,
+        which cannot decode WebP. Matrix sends photos as WebP."""
+        import pytest
+        Image = pytest.importorskip("PIL.Image", reason="Pillow not installed; transcode is best-effort")
+        from agent.image_routing import _file_to_data_url
+
+        img_path = tmp_path / "matrix.webp"
+        Image.new("RGB", (8, 8), (0, 128, 255)).save(img_path, format="WEBP")
+        url = _file_to_data_url(img_path)
+        assert url is not None
+        assert url.startswith("data:image/png;base64,"), (
+            f"WebP must be transcoded to PNG for llama.cpp stb_image, got: {url[:60]}"
+        )
+
     def test_file_to_data_url_blocks_read_denied_image_path(self, tmp_path: Path):
         """Native image routing must honor the shared credential read guard."""
         from agent.image_routing import _file_to_data_url

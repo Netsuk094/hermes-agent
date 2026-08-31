@@ -273,6 +273,13 @@ _ANTHROPIC_SUPPORTED_MEDIA_TYPES = frozenset(
     {"image/jpeg", "image/png", "image/gif", "image/webp"}
 )
 
+# Formats we embed as-is. WebP is in the Anthropic set above but llama.cpp
+# mtmd decodes with stb_image, which cannot read WebP — decode failure
+# falls through to the video path and the model hallucinates (empty /
+# "Video:" artifacts). Matrix/Element sends photos as WebP, so we transcode
+# it to PNG like BMP/TIFF. JPEG/PNG/GIF are safe for both cloud and stb_image.
+_PASSTHROUGH_MEDIA_TYPES = frozenset({"image/jpeg", "image/png", "image/gif"})
+
 
 def _rasterize_svg_to_png(svg_path: Path, out_path: Path) -> bool:
     """Best-effort SVG → PNG rasterization. Returns True on success.
@@ -337,7 +344,7 @@ def _normalize_to_supported_image(
     the image is base64-embedded into conversation history, so an unsupported
     media_type can never reach the provider and wedge the session.
     """
-    if detected_mime in _ANTHROPIC_SUPPORTED_MEDIA_TYPES:
+    if detected_mime in _PASSTHROUGH_MEDIA_TYPES:
         return image_path, detected_mime, None
 
     out_dir = get_hermes_dir("cache/vision", "temp_vision_images")
@@ -366,6 +373,10 @@ def _normalize_to_supported_image(
                 _img = _img.convert("RGBA")
             _img.save(out_path, format="PNG")
         if out_path.exists() and out_path.stat().st_size > 0:
+            logger.info(
+                "Normalized %s image to PNG for llama.cpp/stb_image compatibility",
+                detected_mime,
+            )
             return out_path, "image/png", None
     except Exception as _exc:
         logger.warning("Failed to normalize %s image to PNG: %s",

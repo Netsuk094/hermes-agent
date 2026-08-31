@@ -16,6 +16,7 @@ from tools.vision_tools import (
     _handle_vision_analyze,
     _determine_mime_type,
     _image_to_base64_data_url,
+    _normalize_to_supported_image,
     _resize_image_for_vision,
     _image_exceeds_dimension,
     _EMBED_MAX_DIMENSION,
@@ -85,6 +86,29 @@ class TestDetermineMimeType:
 # ---------------------------------------------------------------------------
 # _image_to_base64_data_url
 # ---------------------------------------------------------------------------
+
+
+class TestNormalizeToSupportedImage:
+    def test_webp_transcoded_to_png(self, tmp_path):
+        """llama.cpp mtmd/stb_image cannot decode WebP; Matrix sends WebP."""
+        Image = pytest.importorskip("PIL.Image", reason="Pillow required for WebP transcode")
+        src = tmp_path / "matrix.webp"
+        Image.new("RGB", (8, 8), (10, 20, 30)).save(src, format="WEBP")
+        path, mime, err = _normalize_to_supported_image(src, "image/webp")
+        assert err is None
+        assert mime == "image/png"
+        assert path is not None
+        assert path != src
+        assert path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        path.unlink()
+
+    def test_png_passes_through(self, tmp_path):
+        src = tmp_path / "ok.png"
+        src.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+        path, mime, err = _normalize_to_supported_image(src, "image/png")
+        assert err is None
+        assert mime == "image/png"
+        assert path == src
 
 
 class TestImageToBase64DataUrl:

@@ -587,6 +587,12 @@ _UNIVERSALLY_SUPPORTED_MIMES = frozenset({
     "image/png", "image/jpeg", "image/gif", "image/webp",
 })
 
+# llama.cpp mtmd decodes images with stb_image, which does NOT support WebP.
+# A failed stbi_load falls through to the video decoder, so the model sees
+# empty / "Video:" artifacts and hallucinates. Matrix/Element sends photos
+# as WebP, so we transcode it to PNG even though cloud vision APIs accept it.
+_LLAMACPP_UNSAFE_MIMES = frozenset({"image/webp"})
+
 
 def _transcode_to_png(raw: bytes) -> Optional[bytes]:
     """Decode arbitrary image bytes with Pillow and re-encode as PNG.
@@ -705,7 +711,7 @@ def _file_to_data_url(path: Path) -> Optional[str]:
         logger.warning("image_routing: failed to read %s — %s", path, exc)
         return None
     mime = _guess_mime(path, raw=raw)
-    if mime not in _UNIVERSALLY_SUPPORTED_MIMES:
+    if mime not in _UNIVERSALLY_SUPPORTED_MIMES or mime in _LLAMACPP_UNSAFE_MIMES:
         transcoded = _transcode_to_png(raw)
         if transcoded is None:
             logger.warning(
